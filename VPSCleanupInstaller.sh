@@ -113,6 +113,14 @@ if [[ ! "$JOURNALCTL_DEPTH" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
+# --- Максимальный размер journalctl ---
+echo -e "\n${B_YELLOW}Максимальный размер journalctl в МБ (0 - без ограничения по размеру):${NC}"
+read -p "МБ: " JOURNALCTL_MAXSIZE
+if [[ ! "$JOURNALCTL_MAXSIZE" =~ ^[0-9]+$ ]]; then
+    echo -e "${B_RED}Ошибка: нужно целое число ≥ 0. Выход.${NC}"
+    exit 1
+fi
+
 # --- Глубина хранения security-логов ---
 echo -e "\n${B_YELLOW}Глубина хранения security-логов (syslog/auth.log/ufw.log и др.) в днях (0 - удалять всё):${NC}"
 read -p "Дней: " SECLOG_DEPTH
@@ -171,6 +179,7 @@ cat << 'EOF' > "$S"
 #!/bin/bash
 
 JOURNALCTL_DEPTH="__JOURNALCTL_DEPTH__"
+JOURNALCTL_MAXSIZE="__JOURNALCTL_MAXSIZE__"
 SECLOG_DEPTH="__SECLOG_DEPTH__"
 DOCKER_CLEAN="__DOCKER_CLEAN__"
 KERNEL_CLEAN="__KERNEL_CLEAN__"
@@ -192,7 +201,8 @@ if [ "$KERNEL_CLEAN" = "yes" ]; then
 fi
 
 if command -v apt-get &>/dev/null; then
-    apt-get purge -y $(dpkg -l | awk '/^rc/ {print $2}') &>/dev/null
+    RC_PKGS=$(dpkg -l | awk '/^rc/ {print $2}')
+    [ -n "$RC_PKGS" ] && apt-get purge -y $RC_PKGS &>/dev/null
     apt-get autoremove -y &>/dev/null
     apt-get autoclean -y &>/dev/null
     apt-get clean -y &>/dev/null
@@ -201,15 +211,34 @@ elif command -v dnf &>/dev/null; then
     dnf clean all -y &>/dev/null
 fi
 
+if command -v pip3 &>/dev/null; then
+    pip3 cache purge &>/dev/null
+fi
+if command -v pip &>/dev/null; then
+    pip cache purge &>/dev/null
+fi
+if command -v npm &>/dev/null; then
+    npm cache clean --force &>/dev/null
+fi
+if command -v snap &>/dev/null; then
+    snap list --all 2>/dev/null | awk '/disabled/{print $1, $3}' | while read -r sname srev; do
+        snap remove "$sname" --revision="$srev" &>/dev/null
+    done
+fi
+
 if [ "$JOURNALCTL_DEPTH" -eq 0 ]; then
     journalctl --vacuum-time=1s &>/dev/null
 else
     journalctl --vacuum-time="${JOURNALCTL_DEPTH}d" &>/dev/null
 fi
+if [ "$JOURNALCTL_MAXSIZE" -gt 0 ]; then
+    journalctl --vacuum-size="${JOURNALCTL_MAXSIZE}M" &>/dev/null
+fi
 systemctl restart systemd-journald &>/dev/null
 
-find /var/log -type f -name "*.gz" -delete
-find /var/log -type f -name "*.1" -delete
+find /var/log -type f -name "*.gz" -mtime "+$SECLOG_DEPTH" -delete
+find /var/log -type f -name "*.1" -mtime "+$SECLOG_DEPTH" -delete
+find /var/log -mindepth 2 -type f -name "*.log" -mtime "+$SECLOG_DEPTH" -delete
 
 SECURITY_LOGS="syslog messages auth.log secure kern.log cron.log user.log ufw.log daemon.log"
 
@@ -277,18 +306,24 @@ cleanup_tmp_dir() {
 cleanup_tmp_dir "/tmp"
 cleanup_tmp_dir "/var/tmp"
 
+if command -v coredumpctl &>/dev/null; then
+    coredumpctl --vacuum-time="${SECLOG_DEPTH}d" &>/dev/null
+fi
+find /var/crash -type f -mtime "+$SECLOG_DEPTH" -delete 2>/dev/null
+find /var/lib/systemd/coredump -type f -mtime "+$SECLOG_DEPTH" -delete 2>/dev/null
+
 if [ "$DOCKER_CLEAN" = "yes" ] && command -v docker &>/dev/null; then
     docker system prune -a --volumes -f &>/dev/null
 fi
 
 sync
-echo 3 > /proc/sys/net/ipv4/route/flush 2>/dev/null
 
 echo "$LOG_PREFIX Очистка завершена"
 df -h / | awk 'NR==2 {print "Всего: " $2 " | Занято: " $3 " | Свободно: " $4 " (" $5 ")"}'
 EOF
 
 sed -i "s/__JOURNALCTL_DEPTH__/$JOURNALCTL_DEPTH/" "$S"
+sed -i "s/__JOURNALCTL_MAXSIZE__/$JOURNALCTL_MAXSIZE/" "$S"
 sed -i "s/__SECLOG_DEPTH__/$SECLOG_DEPTH/" "$S"
 sed -i "s/__DOCKER_CLEAN__/$DOCKER_CLEAN/" "$S"
 sed -i "s/__KERNEL_CLEAN__/$KERNEL_CLEAN/" "$S"
@@ -300,5 +335,5 @@ C_JOB="$CRON_MIN $CRON_HOUR $CRON_DOM $CRON_MON $CRON_DOW $S >> /var/log/vps_cle
 
 echo -e "\n${B_GREEN}Задача cron успешно создана!${NC}"
 echo -e "Очистка будет выполняться ${B_CYAN}${SCHEDULE_DESC}${NC} в ${B_CYAN}${USER_TIME}${NC}."
-echo -e "Глубина journalctl: ${B_CYAN}${JOURNALCTL_DEPTH} дн.${NC} | Глубина security-логов: ${B_CYAN}${SECLOG_DEPTH} дн.${NC} | Docker: ${B_CYAN}${DOCKER_CLEAN}${NC} | Старые ядра: ${B_CYAN}${KERNEL_CLEAN}${NC}"
+echo -e "Глубина journalctl: ${B_CYAN}${JOURNALCTL_DEPTH} дн.${NC} | Макс. размер journalctl: ${B_CYAN}${JOURNALCTL_MAXSIZE} МБ${NC} | Глубина security-логов: ${B_CYAN}${SECLOG_DEPTH} дн.${NC} | Docker: ${B_CYAN}${DOCKER_CLEAN}${NC} | Старые ядра: ${B_CYAN}${KERNEL_CLEAN}${NC}"
 echo -e "Лог выполнения: ${B_CYAN}/var/log/vps_cleanup.log${NC}"
